@@ -1,0 +1,10 @@
+node_modules/
+backend/venv/
+*__pycache__/
+frontend/node_modules/
+frontend/build/
+*.log
+.DS_Store
+build/
+backend/.env
+package-lock.json

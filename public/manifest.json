@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "PartSelect Assistant",
+  "version": "1.0",
+  "description": "AI-powered assistant for PartSelect refrigerator and dishwasher parts",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "index.html"
+  },
+  "action": {
+    "default_title": "Open PartSelect Assistant"
+  },
+  "permissions": ["sidePanel", "tabs", "activeTab"],
+  "host_permissions": ["https://www.partselect.com/*", "http://localhost:8000/*"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://localhost:8000;"
+  }
+}
