@@ -14,7 +14,7 @@ class LLMService:
                 {"role": "system", "content": system_prompt},
                 *messages
             ],
-            temperature=0.3,
+            temperature=0.1,
             max_tokens=1024
         )
         return response.choices[0].message.content

@@ -40,6 +40,15 @@ class RAGService:
                         0, page_ps_number
                     )
 
+        # Step 2b: Detect appliance type and check for mismatches
+        appliance_type = self._detect_appliance_type(message, entities)
+
+        mismatch = self._check_compatibility_mismatch(
+            intent, entities, appliance_type
+        )
+        if mismatch:
+            return mismatch
+
         # Step 3: Embed query and search vector store
         query_embedding = self.embedding_service.embed(message)
 
@@ -53,18 +62,54 @@ class RAGService:
                 where={"ps_number": ps_num}
             )
 
-        # If no PS number or no results, use intent-based filtering
+        # Try OEM part number lookup if no PS number matched
+        if (not results or not results.get("documents")
+                or not results["documents"][0]):
+            for oem in entities.get("oem_candidates", []):
+                try:
+                    oem_results = self.vector_store.search(
+                        query_embedding, n_results=5,
+                        where={"oem_part_number": oem}
+                    )
+                    if (oem_results and oem_results.get("documents")
+                            and oem_results["documents"][0]):
+                        results = oem_results
+                        break
+                except Exception:
+                    continue
+
+        # If no PS number or no results, use intent + appliance type filtering
         if (not results or not results.get("documents")
                 or not results["documents"][0]):
             where_filter = None
+            chunk_filter = None
             if intent == "COMPATIBILITY_CHECK":
-                where_filter = {"chunk_type": "compatibility"}
+                chunk_filter = {"chunk_type": "compatibility"}
             elif intent == "TROUBLESHOOT":
-                where_filter = {"chunk_type": "troubleshooting"}
+                chunk_filter = {"chunk_type": "overview"}
+
+            appliance_filter = ({"appliance_type": appliance_type}
+                                if appliance_type else None)
+
+            if chunk_filter and appliance_filter:
+                where_filter = {"$and": [chunk_filter, appliance_filter]}
+            elif chunk_filter:
+                where_filter = chunk_filter
+            elif appliance_filter:
+                where_filter = appliance_filter
 
             results = self.vector_store.search(
                 query_embedding, n_results=5, where=where_filter
             )
+
+        # Fallback: appliance-type only
+        if (not results or not results.get("documents")
+                or not results["documents"][0]):
+            if appliance_type:
+                results = self.vector_store.search(
+                    query_embedding, n_results=5,
+                    where={"appliance_type": appliance_type}
+                )
 
         # Final fallback: unfiltered semantic search
         if (not results or not results.get("documents")
@@ -81,8 +126,10 @@ class RAGService:
         ]
         response_text = self.llm_service.chat(system_prompt, messages)
 
-        # Step 6: Extract part cards from search results
-        part_cards = self._extract_part_cards(results)
+        # Step 6: Extract part cards filtered by relevance
+        part_cards = self._extract_part_cards(
+            results, response_text, appliance_type
+        )
 
         # Step 7: Generate suggested follow-up queries
         suggested = self._generate_suggestions(intent, entities)
@@ -120,9 +167,98 @@ class RAGService:
         model_numbers = re.findall(
             r'\b[A-Z]{2,}\d{3,}[A-Z]*\d*[A-Z]*\b', message
         )
+        # Also capture standalone numeric part numbers (e.g., "242126602")
+        oem_candidates = list(model_numbers) + re.findall(
+            r'\b\d{6,}\b', message
+        )
         return {
             "ps_numbers": [p.upper() for p in ps_numbers],
-            "model_numbers": model_numbers
+            "model_numbers": model_numbers,
+            "oem_candidates": oem_candidates
+        }
+
+    def _detect_appliance_type(self, message: str, entities: dict) -> str:
+        """Detect whether the query is about a refrigerator or dishwasher.
+        Returns 'Refrigerator', 'Dishwasher', or None."""
+        lower = message.lower()
+
+        fridge_keywords = ["refrigerator", "fridge", "freezer", "ice maker"]
+        dishwasher_keywords = ["dishwasher", "dish washer"]
+
+        fridge_score = sum(1 for kw in fridge_keywords if kw in lower)
+        dw_score = sum(1 for kw in dishwasher_keywords if kw in lower)
+
+        if fridge_score > 0 and dw_score == 0:
+            return "Refrigerator"
+        if dw_score > 0 and fridge_score == 0:
+            return "Dishwasher"
+
+        # Look up appliance type from PS number in ChromaDB
+        if entities.get("ps_numbers"):
+            ps_type = self._lookup_part_appliance_type(entities["ps_numbers"][0])
+            if ps_type:
+                return ps_type
+
+        # LLM fallback for ambiguous queries
+        if fridge_score > 0 or dw_score > 0 or entities.get("model_numbers"):
+            classification = self.llm_service.classify(
+                TOPIC_CHECK_PROMPT.format(message=message)
+            )
+            if "REFRIGERATOR" in classification.upper():
+                return "Refrigerator"
+            if "DISHWASHER" in classification.upper():
+                return "Dishwasher"
+
+        return None
+
+    def _lookup_part_appliance_type(self, ps_number: str) -> str:
+        """Look up a part's appliance type from ChromaDB metadata."""
+        try:
+            results = self.vector_store.search(
+                [0.0] * 1536, n_results=1,
+                where={"ps_number": ps_number}
+            )
+            if (results and results.get("metadatas")
+                    and results["metadatas"][0]):
+                return results["metadatas"][0][0].get("appliance_type")
+        except Exception:
+            pass
+        return None
+
+    def _check_compatibility_mismatch(self, intent: str, entities: dict,
+                                      appliance_type: str) -> dict:
+        """Detect cross-appliance compatibility mismatches.
+        Returns a response dict if mismatch found, None otherwise."""
+        if intent != "COMPATIBILITY_CHECK":
+            return None
+        if not entities.get("ps_numbers"):
+            return None
+
+        ps_num = entities["ps_numbers"][0]
+        part_type = self._lookup_part_appliance_type(ps_num)
+
+        if not part_type or not appliance_type:
+            return None
+        if part_type == appliance_type:
+            return None
+
+        return {
+            "role": "assistant",
+            "content": (
+                f"It looks like **{ps_num}** is a **{part_type.lower()}** part, "
+                f"but your model number appears to be for a "
+                f"**{appliance_type.lower()}**.\n\n"
+                f"{part_type} parts are not compatible with "
+                f"{appliance_type.lower()} models.\n\n"
+                f"Would you like me to help you find the right "
+                f"{appliance_type.lower()} part instead?"
+            ),
+            "parts": [],
+            "suggested_queries": [
+                f"Find {appliance_type.lower()} parts for my model",
+                f"What does {ps_num} fit?",
+                f"Help me find the right part"
+            ]
         }
 
     def _build_context(self, results: dict) -> str:
@@ -141,25 +277,43 @@ class RAGService:
             chunks.append(f"{header}\n{doc}")
         return "\n\n---\n\n".join(chunks)
 
-    def _extract_part_cards(self, results: dict) -> list:
+    def _extract_part_cards(self, results: dict,
+                            response_text: str = "",
+                            appliance_type: str = None) -> list:
         if (not results or not results.get("metadatas")
                 or not results["metadatas"][0]):
             return []
+
+        # Find PS numbers the LLM actually mentioned in its response
+        mentioned = set()
+        if response_text:
+            mentioned = set(
+                ps.upper() for ps in
+                re.findall(r'PS\d{6,}', response_text, re.IGNORECASE)
+            )
 
         seen = set()
         cards = []
         for meta in results["metadatas"][0]:
             ps = meta.get("ps_number")
-            if ps and ps not in seen:
-                seen.add(ps)
-                cards.append({
-                    "ps_number": ps,
-                    "name": meta.get("name", ""),
-                    "price": meta.get("price"),
-                    "image_url": meta.get("image_url"),
-                    "part_url": meta.get("source_url"),
-                    "oem_part_number": meta.get("oem_part_number")
-                })
+            if not ps or ps in seen:
+                continue
+            # If LLM mentioned specific parts, only show those
+            if mentioned and ps not in mentioned:
+                continue
+            # Otherwise filter by appliance type if known
+            if (not mentioned and appliance_type
+                    and meta.get("appliance_type") != appliance_type):
+                continue
+            seen.add(ps)
+            cards.append({
+                "ps_number": ps,
+                "name": meta.get("name", ""),
+                "price": meta.get("price"),
+                "image_url": meta.get("image_url"),
+                "part_url": meta.get("source_url"),
+                "oem_part_number": meta.get("oem_part_number")
+            })
         return cards[:3]
 
     def _generate_suggestions(self, intent: str, entities: dict) -> list:
